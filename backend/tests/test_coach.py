@@ -33,7 +33,13 @@ def test_player_resolution_prefers_longest_owned_name() -> None:
 
 
 def test_repository_agent_definitions_are_valid() -> None:
-    validate_agent_definitions("/app/agents")
+    backend_directory = Path(__file__).resolve().parents[1]
+    candidates = (
+        backend_directory.parent / ".github" / "agents",
+        backend_directory / "agents",
+    )
+    agent_directory = next(candidate for candidate in candidates if candidate.is_dir())
+    validate_agent_definitions(str(agent_directory))
 
 
 def test_agent_validation_rejects_broadened_tools(tmp_path: Path) -> None:
