@@ -1,0 +1,36 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Backend
+bin/
+obj/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Editors and operating systems
+.vscode/
+.idea/
+.vs/
+.DS_Store
+*.sw?

@@ -1,0 +1,17 @@
+FROM python:3.13-slim
+
+WORKDIR /app
+COPY backend/pyproject.toml ./
+COPY backend/app ./app
+RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -e '.[dev]'
+COPY backend/ .
+COPY .github/agents ./agents
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    ENVIRONMENT=Development \
+    AGENT_DIRECTORY=/app/agents
+
+EXPOSE 8080
+
+CMD ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload"]
