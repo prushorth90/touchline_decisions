@@ -18,8 +18,14 @@ Full-stack FPL analysis application with live team, squad, player, fixture, dete
 │   ├── app/              FastAPI application and deterministic FPL logic
 │   ├── migrations/       Alembic database migrations
 │   └── tests/            Pytest backend tests
+├── lambda/
+│   └── gameweek_analysis/ Standalone Python 3.13 FPL form-ranking Lambda
 └── frontend/             React application
 ```
+
+The [gameweek analysis Lambda](lambda/gameweek_analysis/README.md) runs and tests
+independently of the backend, databases, and AWS. Its guide includes local
+invocation and a statement-by-statement execution walkthrough.
 
 ## Prerequisites
 
