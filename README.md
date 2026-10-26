@@ -55,6 +55,37 @@ docker compose down
 
 Use `docker compose down --volumes` only when the PostgreSQL and Redis data may be discarded.
 
+### Existing database password mismatch
+
+PostgreSQL applies `POSTGRES_USER`, `POSTGRES_DB`, and `POSTGRES_PASSWORD` only when
+initializing an empty data volume. Changing `.env` does not change existing database
+credentials. If PostgreSQL is unhealthy or the backend reports `password authentication
+failed`, restore the original password in `.env`, or explicitly update the stored
+password to match the current configuration.
+
+For the development container, the following preserves existing data and updates the
+configured user's password through its local administrative connection:
+
+```bash
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
+
+At the `psql` prompt, run the following and enter the current `.env` password twice:
+
+```text
+\password
+\q
+```
+
+Then rebuild and wait for all services to become healthy:
+
+```bash
+docker compose up --build -d --wait
+```
+
+The PostgreSQL health check verifies password authentication over the container
+network, not just whether the server accepts connections.
+
 ## Backend Development
 
 Create and activate a Python 3.13 virtual environment, then install the project:
