@@ -1,8 +1,12 @@
 # Gameweek analysis Lambda
 
-Standalone Python **3.13** code. No FastAPI, PostgreSQL, Redis, AWS SDK,
-credentials, or service initialization is needed. Nothing is deployed by these
-instructions.
+Standalone Python **3.13** code using `httpx` and `boto3`. No FastAPI,
+PostgreSQL, or Redis is needed. Successful handler invocations upload a report
+to S3; nothing is deployed by these instructions.
+
+For deployment to AWS using CDK-managed Docker image assets, see the separate
+[infrastructure guide](../../infra/README.md). Local workflows below remain
+independent of that deployment.
 
 ## Run locally
 
@@ -14,12 +18,17 @@ python3.13 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt
 python -m pytest
+export AWS_PROFILE=your-configured-profile
+export AWS_DEFAULT_REGION=your-deployment-region
+export REPORT_BUCKET=your-deployed-report-bucket-name
 python invoke_local.py
 ```
 
 [invoke_local.py](./invoke_local.py) is a small Python test script that calls the
 real handler and prints its status and decoded JSON. It makes a live, read-only
-request to the official FPL API; unlike the pytest suite, it needs internet access.
+request to the official FPL API, then **writes** `reports/latest.json` in S3.
+Unlike the pytest suite, it needs internet access, `REPORT_BUCKET`, and AWS
+credentials with `s3:PutObject` permission on that bucket's `reports/*` prefix.
 It exits with status 1 if the handler reports failure.
 
 Equivalent Python invocation from this directory:
@@ -35,7 +44,8 @@ print(json.dumps(json.loads(response["body"]), indent=2))
 
 For an offline invocation, run
 `python -m pytest tests/test_gameweek_analysis.py -k handler_returns_json`.
-All pytest HTTP responses are mocked, so tests never contact FPL.
+All pytest HTTP responses and boto3 clients are mocked, so tests never contact
+FPL or AWS and need no credentials.
 
 Run the remaining checks:
 
@@ -81,9 +91,43 @@ Illustrative successful body (shortened):
   errors. The body contains `error`; the underlying exception is logged.
 - Does not suppress unexpected programming errors.
 
+### Stored report
+
+After fetching, validating every player, and calculating the ranking, the
+handler uploads the JSON to `s3://$REPORT_BUCKET/reports/latest.json` with
+`ContentType="application/json"`. The stored shape is:
+
+```json
+{
+  "players": [
+    {"name": "Example", "form": 8.5, "total_points": 120}
+  ],
+  "generatedAt": "2026-10-26T21:00:00+00:00"
+}
+```
+
+The illustrative list is shortened. The existing handler response retains
+`generated_at` for compatibility; the stored report uses the required
+`generatedAt`, with the same UTC timestamp. Existing behavior for fewer than
+five players (including an empty list) is unchanged.
+
+The handler uses boto3's default credential chain. In AWS this uses temporary
+credentials from the execution role, not embedded keys. The S3 client is created
+only after analysis succeeds, not during module import. There is one
+`put_object` call and no pre-emptive delete or error-report upload. Upstream
+fetching, JSON, or validation errors therefore leave the last successful report
+untouched. S3 atomically replaces the object on a successful write.
+
+A `200` means both analysis and upload succeeded. S3 SDK/transport errors are
+logged with tracebacks and return `500` with `{"error": "Unable to store gameweek report"}`.
+Missing/blank `REPORT_BUCKET` and unexpected exceptions are logged with
+tracebacks and re-raised. The bucket remains private; see the infrastructure
+guide for the exact IAM policy, redeployment, and console verification.
+
 The connect timeout is 3 seconds; read, write, and pool timeouts are each
 10 seconds. These are HTTP phase/inactivity timeouts, **not** an overall
-wall-clock deadline. There are no automatic retries. For future AWS deployment,
+wall-clock deadline. FPL requests have no automatic retries; boto3 uses its
+standard SDK retry configuration. For AWS deployment,
 allow enough Lambda execution time (for example, 30 seconds) for normal requests.
 
 Each invocation creates and closes its own HTTP client and builds a new result.
@@ -92,9 +136,10 @@ There is no cache or mutable cross-invocation business state.
 ## Build and invoke with Docker (Apple Silicon)
 
 Start Docker Desktop with Linux containers. Run these commands from the
-repository root; no AWS credentials, AWS CLI, Compose services, or deployment
-are needed. Building pulls a public AWS image and Python packages; invoking
-the handler needs internet access to the public FPL API.
+repository root. No Compose services are needed. Building needs no AWS
+credentials and pulls a public AWS image and Python packages. A successful
+handler invocation needs internet access to FPL and S3, a deployed bucket, and
+AWS credentials with scoped write permission.
 
 ### Build an ARM64 image
 
@@ -123,7 +168,7 @@ docker image inspect gameweek-analysis:local \
 
 The [Dockerfile](./Dockerfile) uses the official
 `public.ecr.aws/lambda/python:3.13` base (Amazon Linux 2023). It installs only
-[runtime requirements](./requirements.txt): `httpx` and its transitive
+[runtime requirements](./requirements.txt): `httpx`, `boto3`, and their transitive
 dependencies, not pytest, Ruff, mypy, FastAPI, or backend dependencies.
 The AWS base already supplies Python, the Lambda Runtime Interface Client
 (RIC), the Runtime Interface Emulator (RIE), and runtime-provided libraries;
@@ -140,12 +185,22 @@ tests, caches, and unrelated files from the build context.
 In one terminal:
 
 ```bash
+# Example for a local development profile; never bake credentials into the image.
+export AWS_PROFILE=your-configured-profile
+export AWS_DEFAULT_REGION=your-deployment-region
+export REPORT_BUCKET=your-deployed-report-bucket-name
 docker run --rm \
   --name gameweek-analysis-local \
   --platform linux/arm64 \
   -p 127.0.0.1:9000:8080 \
+  -v "$HOME/.aws:/root/.aws:ro" \
+  -e AWS_PROFILE -e AWS_DEFAULT_REGION -e REPORT_BUCKET \
   gameweek-analysis:local
 ```
+
+For SSO, log in on the host first. Your profile's credential provider must
+also work inside the container (host-only `credential_process` executables
+are not automatically available). This invocation writes to the real bucket.
 
 The foreground process prints runtime logs. Host port **9000** maps to the
 emulator's container port **8080**; binding to `127.0.0.1` keeps the endpoint
@@ -198,10 +253,11 @@ must be configured as ARM64 to match this image.
 4. The handler calls `analyze_gameweek()`, which creates an HTTP client,
    fetches the official FPL bootstrap endpoint, validates data, sorts players
    by numeric form, and returns up to five players plus a UTC timestamp.
-   No caching, database, Redis, or AWS service is involved.
-5. The handler builds its `statusCode`/`headers`/string `body` dictionary.
-   Expected upstream failures are logged and represented as 502/504 envelopes;
-   unexpected exceptions remain runtime invocation errors.
+   No caching, database, or Redis is involved.
+5. The handler serializes and uploads the report to S3, then builds its
+   `statusCode`/`headers`/string `body` dictionary. Expected upstream failures
+   are logged and represented as 502/504 envelopes; SDK failures return 500,
+   while configuration and unexpected failures remain invocation errors.
 6. The runtime client serializes the return value and posts it to the Runtime
    API response endpoint. RIE returns that value to curl. It does **not**
    interpret the envelope as an API Gateway HTTP response.
@@ -220,7 +276,7 @@ API Gateway, AWS networking, scaling, or Lambda resource and timeout enforcement
 | Startup | AWS entrypoint plus `handler.handler` | Migrations followed by Uvicorn |
 | Interface | Events delivered through the Lambda Runtime API | An ASGI HTTP server exposing application routes |
 | Local port | RIE listens on 8080, mapped to host 9000 | Uvicorn listens on 8080; development Compose maps host 5082 |
-| Dependencies | Standalone analysis and `httpx` | Backend application, database/cache integrations, and framework dependencies |
+| Dependencies | Standalone analysis, `httpx`, and `boto3` | Backend application, database/cache integrations, and framework dependencies |
 | Lifetime | Local emulator stays running; AWS starts/reuses/freezes environments as needed | Long-running server managed by its container host |
 | Response | Serialized handler return value; `statusCode` is data for direct invocation | Framework sets the actual HTTP status, headers, and response body |
 
@@ -237,30 +293,22 @@ for the base image, architecture, build flags, and local invocation endpoint.
 
 ### [handler.py](./handler.py)
 
-1. `import json` supplies JSON encoding.
-2. `import logging` supplies standard Python error logging.
-3. `TypedDict` describes the response shape for type checking.
-4. `import httpx` provides the HTTP exception types.
-5. The `from analysis ...` statement imports only standalone analysis code.
-6. `logger = ...` obtains a logger; it does not open network connections.
-7. `LambdaResponse` describes the integer status, string headers, and string body.
-8. `handler(event, context)` is the Lambda entry point. Neither argument is
-   needed for this first version, so both are ignored.
-9. `try` begins the expected-success path.
-10. `result = analyze_gameweek()` fetches and ranks players.
-11. `status_code = 200` marks a successful analysis.
-12. `json.dumps(..., allow_nan=False)` serializes the result and disallows
-    nonstandard JSON numbers.
-13. The timeout `except` catches HTTP timeouts specifically.
-14. `logger.exception(...)` records the cause and traceback.
-15. `status_code = 504` identifies an upstream timeout.
-16. `json.dumps({"error": ...})` creates a safe, readable error body.
-17. The next `except` catches HTTP failures and explicitly validated data errors.
-18. Its logger call records the underlying cause.
-19. `status_code = 502` identifies an unusable upstream response.
-20. Its JSON encoding produces the corresponding error message.
-21. The final `return` puts the status, JSON content-type header, and serialized
-    body into the Lambda response envelope.
+1. Imports provide JSON encoding, logging, environment access, the boto3 SDK,
+   HTTP/SDK exception types, and standalone analysis. Importing does not create
+   service clients or make network requests.
+2. `LambdaResponse` describes the response envelope. `handler(event, context)`
+   is the Lambda entry point; both arguments are currently ignored.
+3. `analyze_gameweek()` fetches and validates the data and ranks players.
+4. The handler maps the timestamp to `generatedAt`, serializes strict JSON to
+   UTF-8 bytes, and requires a nonblank `REPORT_BUCKET`.
+5. `boto3.client("s3").put_object(...)` writes the report at the fixed key with
+   the JSON content type. Only after that succeeds does the handler prepare
+   a `200` response using the existing analysis response contract.
+6. Error handlers log tracebacks: HTTP timeouts return 504; upstream HTTP,
+   JSON, or data failures return 502; SDK failures return 500. Unexpected errors,
+   including configuration errors, are logged and re-raised.
+7. The final return contains the status, JSON content-type header, and encoded
+   body. No error branch uploads an object.
 
 ### [analysis.py](./analysis.py)
 

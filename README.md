@@ -20,12 +20,17 @@ Full-stack FPL analysis application with live team, squad, player, fixture, dete
 │   └── tests/            Pytest backend tests
 ├── lambda/
 │   └── gameweek_analysis/ Standalone Python 3.13 FPL form-ranking Lambda
+├── infra/                Independent AWS CDK v2 Lambda deployment
 └── frontend/             React application
 ```
 
 The [gameweek analysis Lambda](lambda/gameweek_analysis/README.md) runs and tests
 independently of the backend, databases, and AWS. Its guide includes local
 invocation and a statement-by-statement execution walkthrough.
+
+To deploy only this Lambda to AWS, see the separate
+[CDK infrastructure guide](infra/README.md). This does not deploy or modify
+the Docker Compose application.
 
 ## Prerequisites
 
