@@ -48,8 +48,9 @@ mypy --strict --python-version 3.13 analysis.py handler.py invoke_local.py
 
 The Lambda entry point is `handler.handler`: file `handler.py`, function
 `handler`. The files in this directory are intended to be at the root of a
-future Lambda deployment package, along with dependencies from
-`requirements.txt`. Select the `python3.13` runtime if deploying later.
+Lambda deployment package, along with dependencies from `requirements.txt`.
+For a ZIP deployment, select the `python3.13` runtime. The container below
+instead supplies its own Python 3.13 runtime.
 
 The handler returns an HTTP-style envelope with `statusCode`, `headers`, and a
 JSON-encoded string in `body`. For a direct Lambda invocation, decode `body` to
@@ -87,6 +88,150 @@ allow enough Lambda execution time (for example, 30 seconds) for normal requests
 
 Each invocation creates and closes its own HTTP client and builds a new result.
 There is no cache or mutable cross-invocation business state.
+
+## Build and invoke with Docker (Apple Silicon)
+
+Start Docker Desktop with Linux containers. Run these commands from the
+repository root; no AWS credentials, AWS CLI, Compose services, or deployment
+are needed. Building pulls a public AWS image and Python packages; invoking
+the handler needs internet access to the public FPL API.
+
+### Build an ARM64 image
+
+```bash
+docker buildx build \
+  --platform linux/arm64 \
+  --provenance=false \
+  --load \
+  -t gameweek-analysis:local \
+  lambda/gameweek_analysis
+```
+
+`--platform linux/arm64` selects Linux ARM64, matching both Apple Silicon's CPU
+and a future ARM64 Lambda function. Docker Desktop runs it in its Linux VM;
+it is not a macOS Python process and needs no x86 emulation. `--load` makes the
+single-platform image available to local `docker run`. `--provenance=false`
+follows AWS's Lambda-compatible image build guidance.
+
+Verify the image architecture:
+
+```bash
+docker image inspect gameweek-analysis:local \
+  --format '{{.Os}}/{{.Architecture}}'
+# Expected: linux/arm64
+```
+
+The [Dockerfile](./Dockerfile) uses the official
+`public.ecr.aws/lambda/python:3.13` base (Amazon Linux 2023). It installs only
+[runtime requirements](./requirements.txt): `httpx` and its transitive
+dependencies, not pytest, Ruff, mypy, FastAPI, or backend dependencies.
+The AWS base already supplies Python, the Lambda Runtime Interface Client
+(RIC), the Runtime Interface Emulator (RIE), and runtime-provided libraries;
+"only required dependencies" refers to what this Dockerfile adds.
+
+Dependencies and the two application modules go into `LAMBDA_TASK_ROOT`
+(`/var/task`), which is on the runtime's Python import path. Copying requirements
+before source lets Docker reuse the dependency layer when only code changes.
+The [.dockerignore](./.dockerignore) allowlist excludes virtual environments,
+tests, caches, and unrelated files from the build context.
+
+### Run on local port 9000
+
+In one terminal:
+
+```bash
+docker run --rm \
+  --name gameweek-analysis-local \
+  --platform linux/arm64 \
+  -p 127.0.0.1:9000:8080 \
+  gameweek-analysis:local
+```
+
+The foreground process prints runtime logs. Host port **9000** maps to the
+emulator's container port **8080**; binding to `127.0.0.1` keeps the endpoint
+local to your Mac. If port 9000 is already occupied, stop the conflicting
+container or process first.
+
+In another terminal:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  --request POST \
+  'http://localhost:9000/2015-03-31/functions/function/invocations' \
+  --header 'Content-Type: application/json' \
+  --data '{}'
+```
+
+The response is the handler's envelope, for example
+`{"statusCode":200,"headers":{"Content-Type":"application/json"},"body":"..."}`.
+The `body` is a JSON-encoded string, not a nested object. Inspect `statusCode`
+and decode `body` to see the players or error.
+
+**Important:** the invocation endpoint's HTTP status and the returned
+`statusCode` are different layers. A handled FPL error can still produce HTTP
+200 from the emulator with `statusCode: 502` or `504` in the payload.
+`curl --fail-with-body` does not detect those application-level errors.
+
+Stop with Ctrl-C in the first terminal, or:
+
+```bash
+docker stop gameweek-analysis-local
+```
+
+`--rm` removes the stopped container, not the built image. Nothing here pushes
+to ECR, creates a Lambda function, or changes
+[docker-compose.yml](../../docker-compose.yml). A future container-based Lambda
+must be configured as ARM64 to match this image.
+
+### What happens internally when curl invokes it?
+
+1. At container startup, the inherited AWS entrypoint reads
+   `CMD ["handler.handler"]`. Locally, with no AWS Runtime API environment,
+   it starts RIE and the Python runtime client. There is no Uvicorn server.
+2. Docker forwards curl's POST from Mac port 9000 to container port 8080.
+   RIE accepts it at the Lambda invocation endpoint and exposes the JSON
+   payload as an event through its emulated Lambda Runtime API.
+3. The runtime client imports `handler.py`, resolves its `handler` function,
+   and calls it with the decoded event (`{}`) and a Lambda context object.
+   Imports occur during runtime initialization, not on every warm invocation.
+   This function currently ignores both arguments.
+4. The handler calls `analyze_gameweek()`, which creates an HTTP client,
+   fetches the official FPL bootstrap endpoint, validates data, sorts players
+   by numeric form, and returns up to five players plus a UTC timestamp.
+   No caching, database, Redis, or AWS service is involved.
+5. The handler builds its `statusCode`/`headers`/string `body` dictionary.
+   Expected upstream failures are logged and represented as 502/504 envelopes;
+   unexpected exceptions remain runtime invocation errors.
+6. The runtime client serializes the return value and posts it to the Runtime
+   API response endpoint. RIE returns that value to curl. It does **not**
+   interpret the envelope as an API Gateway HTTP response.
+7. The runtime remains alive to process subsequent events; every call still
+   fetches fresh FPL data. On AWS, the managed Lambda service provides the
+   Runtime API instead of RIE and controls execution environment lifecycle.
+
+RIE tests the runtime/handler contract locally; it does not reproduce IAM,
+API Gateway, AWS networking, scaling, or Lambda resource and timeout enforcement.
+
+### How this differs from the FastAPI container
+
+| Concern | This Lambda image | Existing FastAPI backend image |
+| --- | --- | --- |
+| Base | AWS Lambda Python 3.13 on Amazon Linux 2023 | `python:3.13-slim` |
+| Startup | AWS entrypoint plus `handler.handler` | Migrations followed by Uvicorn |
+| Interface | Events delivered through the Lambda Runtime API | An ASGI HTTP server exposing application routes |
+| Local port | RIE listens on 8080, mapped to host 9000 | Uvicorn listens on 8080; development Compose maps host 5082 |
+| Dependencies | Standalone analysis and `httpx` | Backend application, database/cache integrations, and framework dependencies |
+| Lifetime | Local emulator stays running; AWS starts/reuses/freezes environments as needed | Long-running server managed by its container host |
+| Response | Serialized handler return value; `statusCode` is data for direct invocation | Framework sets the actual HTTP status, headers, and response body |
+
+The existing [backend Dockerfile](../../backend/Dockerfile) runs a web service.
+This Lambda image is an event processor, not another FastAPI API server:
+`/health`, `/docs`, and existing application routes are not available.
+In AWS, an HTTP-facing integration such as API Gateway or a Function URL would
+be a separate configuration; none is added here.
+
+See the [official AWS Python container image guide](https://docs.aws.amazon.com/lambda/latest/dg/python-image.html)
+for the base image, architecture, build flags, and local invocation endpoint.
 
 ## Execution flow, statement by statement
 
