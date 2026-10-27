@@ -5,6 +5,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -233,6 +234,98 @@ def test_validation_failure_keeps_previous_successful_report(api_mock, s3_mock) 
     assert handler({}, None)["statusCode"] == 502
     s3_mock.put_object.assert_called_once()
     assert s3_mock.put_object.call_args == previous_upload
+
+
+@pytest.mark.parametrize("event, invocation_type", [
+    ({}, "manual"),
+    ({
+        "source": "touchline.gameweek.scheduler",
+        "scheduleArn": "arn:aws:scheduler:us-east-1:123456789012:schedule/test/gameweek",
+        "scheduledTime": "2026-10-27T00:00:00Z",
+        "executionId": "execution-123",
+        "attemptNumber": "1",
+    }, "scheduled"),
+])
+def test_invocation_logs_include_source_and_correlation(
+    api_mock, s3_mock, caplog, event, invocation_type,
+) -> None:
+    set_response(api_mock, {"elements": [player("Best", "9.0")]})
+    with caplog.at_level(logging.INFO):
+        response = handler(event, SimpleNamespace(aws_request_id="request-123"))
+    assert response["statusCode"] == 200
+    records = [record for record in caplog.records if record.name == "handler"]
+    assert len(records) == 2
+    for record in records:
+        assert f'"invocationType": "{invocation_type}"' in record.message
+        assert '"requestId": "request-123"' in record.message
+        if invocation_type == "scheduled":
+            for key, value in event.items():
+                if key != "source":
+                    assert f'"{key}": "{value}"' in record.message
+    assert "report stored" in records[-1].message
+    assert '"playerCount": 1' in records[-1].message
+
+
+@pytest.mark.parametrize("error", [
+    httpx.ReadTimeout("timed out"),
+    httpx.ConnectError("unavailable"),
+])
+def test_scheduled_upstream_failure_raises_without_touching_report(
+    api_mock, s3_mock, caplog, error,
+) -> None:
+    set_response(api_mock, {"elements": [player("Best", "9.0")]})
+    assert handler({}, None)["statusCode"] == 200
+    previous_upload = s3_mock.put_object.call_args
+    api_mock.get.side_effect = error
+    with caplog.at_level(logging.ERROR), pytest.raises(type(error)):
+        handler({"source": "touchline.gameweek.scheduler"}, None)
+    s3_mock.put_object.assert_called_once()
+    assert s3_mock.put_object.call_args == previous_upload
+    s3_mock.delete_object.assert_not_called()
+    assert any(
+        record.exc_info and '"invocationType": "scheduled"' in record.message
+        for record in caplog.records
+    )
+
+
+def test_scheduled_validation_failure_preserves_previous_report(api_mock, s3_mock) -> None:
+    set_response(api_mock, {"elements": [player("Best", "9.0")]})
+    assert handler({}, None)["statusCode"] == 200
+    previous_upload = s3_mock.put_object.call_args
+    set_response(api_mock, {"elements": [player("Bad", "NaN")]})
+    with pytest.raises(ValueError, match="finite"):
+        handler({"source": "touchline.gameweek.scheduler"}, None)
+    s3_mock.put_object.assert_called_once()
+    assert s3_mock.put_object.call_args == previous_upload
+    s3_mock.delete_object.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [
+    ClientError({"Error": {"Code": "AccessDenied", "Message": "Denied"}}, "PutObject"),
+    EndpointConnectionError(endpoint_url="https://s3.example.test"),
+])
+def test_scheduled_upload_failure_raises_without_deleting_report(
+    api_mock, s3_mock, error,
+) -> None:
+    set_response(api_mock, {"elements": [player("Best", "9.0")]})
+    s3_mock.put_object.side_effect = error
+    with pytest.raises(type(error)):
+        handler({"source": "touchline.gameweek.scheduler"}, None)
+    s3_mock.put_object.assert_called_once()
+    s3_mock.delete_object.assert_not_called()
+
+
+def test_serialization_failure_happens_before_upload(api_mock, s3_mock) -> None:
+    with (
+        patch("handler.analyze_gameweek", return_value={
+            "players": [],
+            "generated_at": datetime.now(UTC).isoformat(),
+            "unexpected": object(),
+        }),
+        pytest.raises(TypeError),
+    ):
+        handler({"source": "touchline.gameweek.scheduler"}, None)
+    s3_mock.put_object.assert_not_called()
 
 
 def test_handler_import_does_not_load_application_or_services() -> None:

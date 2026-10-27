@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 
@@ -55,6 +56,7 @@ class TouchlineLambdaStackTests(unittest.TestCase):
                         }],
                     },
                     "AccessControl": Match.absent(),
+                    "VersioningConfiguration": {"Status": "Enabled"},
                 },
                 "DeletionPolicy": "Retain",
                 "UpdateReplacePolicy": "Retain",
@@ -73,7 +75,8 @@ class TouchlineLambdaStackTests(unittest.TestCase):
     def test_lambda_can_only_put_objects_in_report_prefix(self) -> None:
         resources = self.template.to_json()["Resources"]
         bucket_id = next(key for key, value in resources.items() if value["Type"] == "AWS::S3::Bucket")
-        role_id = next(key for key, value in resources.items() if value["Type"] == "AWS::IAM::Role")
+        function = next(value for value in resources.values() if value["Type"] == "AWS::Lambda::Function")
+        role_id = function["Properties"]["Role"]["Fn::GetAtt"][0]
         self.template.has_resource_properties(
             "AWS::Lambda::Function",
             {
@@ -103,6 +106,99 @@ class TouchlineLambdaStackTests(unittest.TestCase):
             },
         )
 
+    def test_schedule_is_disabled_by_default_and_explicitly_enabled(self) -> None:
+        self.template.has_parameter("ScheduleEnabled", {
+            "Type": "String",
+            "Default": "false",
+            "AllowedValues": ["true", "false"],
+        })
+        self.template.has_condition("EnableGameweekSchedule", {
+            "Fn::Equals": [{"Ref": "ScheduleEnabled"}, "true"],
+        })
+        self.template.resource_count_is("AWS::Scheduler::Schedule", 1)
+        self.template.resource_count_is("AWS::Scheduler::ScheduleGroup", 1)
+        self.template.has_resource_properties("AWS::Scheduler::Schedule", {
+            "ScheduleExpression": "rate(6 hours)",
+            "FlexibleTimeWindow": {"Mode": "OFF"},
+            "State": {"Fn::If": ["EnableGameweekSchedule", "ENABLED", "DISABLED"]},
+            "Target": {
+                "RetryPolicy": {
+                    "MaximumEventAgeInSeconds": 3600,
+                    "MaximumRetryAttempts": 2,
+                },
+                "Input": json.dumps({
+                    "source": "touchline.gameweek.scheduler",
+                    "scheduleArn": "<aws.scheduler.schedule-arn>",
+                    "scheduledTime": "<aws.scheduler.scheduled-time>",
+                    "executionId": "<aws.scheduler.execution-id>",
+                    "attemptNumber": "<aws.scheduler.attempt-number>",
+                }),
+            },
+        })
+
+    def test_scheduler_role_can_only_invoke_existing_function(self) -> None:
+        resources = self.template.to_json()["Resources"]
+        function_id = next(key for key, value in resources.items() if value["Type"] == "AWS::Lambda::Function")
+        group_id = next(key for key, value in resources.items() if value["Type"] == "AWS::Scheduler::ScheduleGroup")
+        schedule = next(value["Properties"] for value in resources.values() if value["Type"] == "AWS::Scheduler::Schedule")
+        role_id = schedule["Target"]["RoleArn"]["Fn::GetAtt"][0]
+        role = resources[role_id]["Properties"]
+        self.assertEqual(role["AssumeRolePolicyDocument"]["Statement"], [{
+            "Action": "sts:AssumeRole",
+            "Effect": "Allow",
+            "Principal": {"Service": "scheduler.amazonaws.com"},
+            "Condition": {"StringEquals": {
+                "aws:SourceAccount": {"Ref": "AWS::AccountId"},
+                "aws:SourceArn": {"Fn::GetAtt": [group_id, "Arn"]},
+            }},
+        }])
+        self.assertEqual(role["Policies"], [{
+            "PolicyName": "InvokeGameweekAnalysis",
+            "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Action": "lambda:InvokeFunction",
+                    "Effect": "Allow",
+                    "Resource": {"Fn::GetAtt": [function_id, "Arn"]},
+                }],
+            },
+        }])
+        self.assertEqual(schedule["Target"]["Arn"], {"Fn::GetAtt": [function_id, "Arn"]})
+        self.assertEqual(schedule["GroupName"], {"Ref": group_id})
+
+    def test_lambda_async_retries_are_bounded(self) -> None:
+        self.template.resource_count_is("AWS::Lambda::EventInvokeConfig", 1)
+        self.template.has_resource_properties("AWS::Lambda::EventInvokeConfig", {
+            "MaximumEventAgeInSeconds": 3600,
+            "MaximumRetryAttempts": 1,
+            "Qualifier": "$LATEST",
+        })
+
+    def test_schedule_arn_output_does_not_require_attribute_lookup(self) -> None:
+        resources = self.template.to_json()["Resources"]
+        schedule_id = next(
+            key for key, value in resources.items()
+            if value["Type"] == "AWS::Scheduler::Schedule"
+        )
+        group_id = next(
+            key for key, value in resources.items()
+            if value["Type"] == "AWS::Scheduler::ScheduleGroup"
+        )
+        self.template.has_output("ScheduleArn", {
+            "Value": {"Fn::Join": ["", [
+                "arn:",
+                {"Ref": "AWS::Partition"},
+                ":scheduler:",
+                {"Ref": "AWS::Region"},
+                ":",
+                {"Ref": "AWS::AccountId"},
+                ":schedule/",
+                {"Ref": group_id},
+                "/",
+                {"Ref": schedule_id},
+            ]]},
+        })
+
     def test_only_minimal_application_resources(self) -> None:
         allowed = {
             "AWS::Lambda::Function",
@@ -111,14 +207,20 @@ class TouchlineLambdaStackTests(unittest.TestCase):
             "AWS::Logs::LogGroup",
             "AWS::S3::Bucket",
             "AWS::S3::BucketPolicy",
+            "AWS::Scheduler::Schedule",
+            "AWS::Scheduler::ScheduleGroup",
+            "AWS::Lambda::EventInvokeConfig",
         }
         resources = self.template.to_json()["Resources"]
         self.assertLessEqual({resource["Type"] for resource in resources.values()}, allowed)
-        self.template.resource_count_is("AWS::IAM::Role", 1)
+        self.template.resource_count_is("AWS::IAM::Role", 2)
         self.template.has_output("FunctionName", {"Value": Match.any_value()})
         self.template.has_output("FunctionArn", {"Value": Match.any_value()})
         self.template.has_output("LogGroupName", {"Value": Match.any_value()})
         self.template.has_output("ReportBucketName", {"Value": Match.any_value()})
+        self.template.has_output("ScheduleName", {"Value": Match.any_value()})
+        self.template.has_output("ScheduleGroupName", {"Value": Match.any_value()})
+        self.template.has_output("ScheduleArn", {"Value": Match.any_value()})
 
 
 if __name__ == "__main__":

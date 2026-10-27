@@ -161,10 +161,11 @@ The CLI displays invocation metadata; inspect any `FunctionError` and the
 response file. The existing handler also returns an HTTP-style `statusCode`
 inside its response: expect `200` and decode the JSON string in `body`.
 A successful Lambda invocation does not guarantee a successful FPL API request:
-the handler can return `502` or `504` without an invocation-level error.
-S3 SDK errors return `500` and are logged with a traceback; missing bucket
+for manual events, the handler can return `502` or `504` without an
+invocation-level error. Manual S3 SDK errors return `500` and are logged with a traceback; missing bucket
 configuration or unexpected exceptions are logged and raised as invocation
-errors. A `200` response means both analysis and the S3 upload succeeded.
+errors. Scheduled events instead raise these expected errors so Lambda can
+retry them. A `200` response means both analysis and the S3 upload succeeded.
 The function accesses the public FPL API over Lambda's default internet
 connectivity; it is not placed in a VPC.
 
@@ -192,7 +193,17 @@ the Lambda role deliberately has neither. If a call fails, open the function's
 Fetching, JSON parsing, and validation finish before S3 is called, so those
 failures leave the previous successful object untouched. Each successful
 `PutObject` atomically replaces `latest.json`; there is no delete-before-write.
-There is no history/versioning or ordering guarantee for concurrent invocations.
+Bucket versioning preserves earlier reports, including the existing unversioned
+report as a null version when versioning is first enabled. There is no ordering
+guarantee for concurrent invocations; the last completed write becomes current.
+The Lambda has no object or object-version deletion permission.
+
+An S3 write can succeed even if its acknowledgement is lost or Lambda times out
+immediately afterward. Such an invocation may be marked failed despite having
+published a complete new report. S3 atomic writes prevent partial JSON and
+versioning preserves the previous successful version; there is no transaction
+between Lambda's final status and S3. An operator with separate
+`s3:GetObjectVersion` and write permissions can recover an older version.
 
 Optional CLI verification using an identity with `s3:GetObject` permission:
 
@@ -209,13 +220,167 @@ aws s3api get-object --bucket "$REPORT_BUCKET" --key reports/latest.json \
 python -m json.tool latest.json
 ```
 
+## Automatic six-hour analysis
+
+The existing Lambda is targeted by **Amazon EventBridge Scheduler**, not an
+EventBridge rule. A `rate(6 hours)` schedule is created **disabled by default**,
+including in development. It uses six-hour intervals, not fixed UTC clock times.
+The flexible delivery window is off, but Scheduler has minute-level precision.
+No second Lambda is created.
+
+The `ScheduleArn` output is constructed from the partition, region, account,
+group name, and schedule name instead of reading the schedule's `Arn`
+attribute. This avoids the observed CloudFormation rollback where schedule
+creation succeeded but retrieving its ARN reported that the resource was not
+found. If an earlier deployment reached `UPDATE_ROLLBACK_COMPLETE` for this
+reason, redeploy the corrected stack; do not destroy it or bootstrap again.
+
+### Deploy, enable, and disable
+
+Run from `infra/`, with its virtual environment active and the AWS environment
+selected as above. Docker must be running to publish a changed image.
+
+```bash
+python -m unittest discover -s tests -v
+cdk synth TouchlineLambdaStack --profile "$AWS_PROFILE"
+cdk diff TouchlineLambdaStack --profile "$AWS_PROFILE"
+
+# Explicitly disabled development deployment:
+cdk deploy TouchlineLambdaStack --profile "$AWS_PROFILE" \
+  --parameters ScheduleEnabled=false
+
+# Opt in to automatic execution:
+cdk deploy TouchlineLambdaStack --profile "$AWS_PROFILE" \
+  --parameters ScheduleEnabled=true
+
+# Stop future scheduled deliveries:
+cdk deploy TouchlineLambdaStack --profile "$AWS_PROFILE" \
+  --parameters ScheduleEnabled=false
+```
+
+For example, set `AWS_PROFILE=prushorthaws` to use that configured profile.
+`ScheduleEnabled` is a CloudFormation parameter defined by this CDK stack, not
+a CDK context flag. Deploy the updated source before trying to use it.
+On subsequent updates CloudFormation normally reuses the previous parameter
+value; default-disabled does **not** automatically disable an enabled schedule.
+Pass `false` explicitly when you want to stop it. Disabling does not cancel
+events already accepted by Lambda or their retries. You can still invoke the
+function manually when the schedule is disabled.
+
+Review the new Scheduler execution IAM role, schedule group, schedule,
+Lambda asynchronous invocation configuration, and bucket versioning change.
+No additional Python dependencies or bootstrap repeat are required.
+
+### Invocation path and permissions
+
+Scheduler assumes a dedicated role trusted by `scheduler.amazonaws.com`.
+The trust policy restricts `aws:SourceAccount` to this account and
+`aws:SourceArn` to this schedule's **group ARN**, as required by Scheduler.
+Its only application permission is `lambda:InvokeFunction` on the existing
+function ARN. For this same-account integration that identity permission
+authorizes invocation; no separate Lambda resource-policy permission is needed.
+The deployment identity/CloudFormation role needs permission to provision these
+resources and pass the Scheduler role to Scheduler.
+
+Scheduler calls the AWS Lambda Invoke API **asynchronously**, with the target
+JSON payload. AWS runs the already deployed container image, fetches public
+FPL data, and writes to S3 using the separate Lambda execution role.
+FastAPI, React, PostgreSQL, Redis, Docker Compose, and your computer need not
+be running. Docker Desktop is only a local image-build/deployment prerequisite;
+AWS hosts the Lambda runtime after deployment.
+
+### Retries and logs
+
+- Scheduler retries failed delivery to Lambda up to **two times**, with a
+  **one-hour maximum event age**. It does not inspect the handler response.
+- After Lambda accepts the event, Lambda permits **one function-error retry**,
+  with a **one-hour maximum event age** for asynchronous events. Throttling and
+  service errors follow Lambda's asynchronous queue retry rules within that age.
+  These function-level settings also apply to other asynchronous invocations.
+- Scheduled upstream, validation, or upload failures are logged and raised;
+  returning an HTTP-style `500` would otherwise count as successful execution.
+  Manual invocations retain the existing response contract.
+- Delivery is not exactly once. Duplicate events or retries can write another
+  complete report version. Scheduler attempt numbers describe delivery
+  attempts, not Lambda's own execution retries.
+- No dead-letter queue or failure destination is configured. Exhausted events
+  are discarded; monitor Scheduler delivery metrics, Lambda `Errors`,
+  `AsyncEventsDropped`, and CloudWatch logs. Add alerting/failure destinations
+  if durable failed-event retention is required.
+
+INFO logs record start and successful storage. Failure logs include tracebacks.
+Each includes `invocationType` (`scheduled` or `manual`) and Lambda `requestId`.
+Scheduled events additionally include `scheduleArn`, `scheduledTime`,
+`executionId`, and `attemptNumber`, supplied through Scheduler context tokens.
+Success logs include bucket, key, generation timestamp, and player count.
+The payload's source marker is diagnostic metadata, not proof of authorization:
+an authorized manual caller can supply the same marker.
+
+### Verify the deployed schedule
+
+Resolve generated names from the stack outputs:
+
+```bash
+SCHEDULE_NAME="$(aws cloudformation describe-stacks \
+  --stack-name TouchlineLambdaStack \
+  --query "Stacks[0].Outputs[?OutputKey=='ScheduleName'].OutputValue | [0]" \
+  --output text)"
+SCHEDULE_GROUP="$(aws cloudformation describe-stacks \
+  --stack-name TouchlineLambdaStack \
+  --query "Stacks[0].Outputs[?OutputKey=='ScheduleGroupName'].OutputValue | [0]" \
+  --output text)"
+LOG_GROUP_NAME="$(aws cloudformation describe-stacks \
+  --stack-name TouchlineLambdaStack \
+  --query "Stacks[0].Outputs[?OutputKey=='LogGroupName'].OutputValue | [0]" \
+  --output text)"
+
+aws scheduler get-schedule --name "$SCHEDULE_NAME" \
+  --group-name "$SCHEDULE_GROUP" \
+  --query '{State:State,Expression:ScheduleExpression,Target:Target}'
+
+# FUNCTION_NAME and REPORT_BUCKET are resolved in the earlier sections.
+aws lambda get-function-event-invoke-config --function-name "$FUNCTION_NAME"
+aws s3api get-bucket-versioning --bucket "$REPORT_BUCKET"
+aws logs tail "$LOG_GROUP_NAME" --since 1h --follow
+```
+
+These commands use exported `AWS_PROFILE` and region variables.
+Confirm `DISABLED` initially and `ENABLED` after opting in, `rate(6 hours)`,
+the existing function ARN, and the expected retry settings. Bucket versioning
+should be `Enabled`. The AWS Console equivalent is **Amazon EventBridge
+Scheduler > Schedules > the ScheduleGroupName group > ScheduleName**.
+
+Invoke manually with `{}` using the earlier command and confirm
+`"invocationType": "manual"`. To exercise the scheduled handler branch without
+waiting, invoke synchronously with
+`{"source":"touchline.gameweek.scheduler"}`. This tests that branch but **does
+not** prove Scheduler delivery, role assumption, or asynchronous retries.
+
+For end-to-end verification, enable the schedule, wait for an actual delivery
+(allow up to the next six-hour interval), and confirm logs contain
+`"invocationType": "scheduled"` and expanded Scheduler metadata. Enabling is
+not an immediate-run command. Check `reports/latest.json` has a new
+`generatedAt` and last-modified time, then inspect history:
+
+```bash
+aws s3api list-object-versions --bucket "$REPORT_BUCKET" \
+  --prefix reports/latest.json
+```
+
+Listing versions requires the operator's own `s3:ListBucketVersions` permission.
+Offline tests cover upstream failures preserving the previous upload,
+scheduled exceptions, manual response compatibility, no delete calls, and
+serialization completing before publication. Do not introduce live production
+failures just to test retries. Disable the development schedule after testing
+if you do not want ongoing runs.
+
 ## Resources and cost
 
 **Application stack:**
 
 - One Docker-image Lambda, ARM64, 256 MB memory, 30-second timeout. The image
   contains the Python runtime and handler; no separate ZIP runtime is configured.
-- One private, HTTPS-only S3 bucket with S3-managed encryption and ACLs disabled.
+- One private, versioned, HTTPS-only S3 bucket with S3-managed encryption and ACLs disabled.
   Reports are stored at `reports/latest.json`. The bucket and objects are
   retained on stack deletion/replacement to protect the last successful report.
 - One Lambda execution IAM role with basic CloudWatch Logs permissions and only
@@ -224,11 +389,14 @@ python -m json.tool latest.json
 - One CloudWatch Logs log group, explicitly connected to the function, with
   **seven-day retention**. It is deleted on stack destruction or replacement
   (development policy; do not use for audit logs).
-- Outputs for the function name, ARN, log group name, and report bucket name.
+- One Scheduler schedule group, one six-hour schedule disabled by default, and
+  one Scheduler execution role restricted to invoking the existing Lambda.
+- One Lambda asynchronous invocation configuration with bounded retries.
+- Outputs for the function name, ARN, log group name, report bucket name,
+  schedule name, schedule ARN, and schedule group name.
 
-There are no schedules, API Gateway, VPC, NAT gateway,
-databases, provisioned concurrency, or other running services. The Lambda only
-runs when invoked; nobody schedules or exposes it publicly.
+There is no API Gateway, VPC, NAT gateway, database, provisioned concurrency,
+or public endpoint. The Lambda runs manually or, when enabled, on schedule.
 
 **Shared bootstrap stack (`CDKToolkit`):**
 
@@ -240,10 +408,11 @@ The S3 bucket is standard CDK deployment infrastructure, not an application
 bucket; it is separate from the application's report bucket.
 These shared resources can serve other CDK apps in the same account/region.
 
-Lambda requests/compute, CloudWatch log ingestion/storage, ECR image storage,
+Scheduler deliveries, Lambda requests/compute, CloudWatch log ingestion/storage, ECR image storage,
 and application/bootstrap S3 storage/requests can incur small charges; do not assume free
 tier eligibility. Seven-day logs and no always-on services keep development
-costs low, but do not impose a spending cap.
+costs low, but do not impose a spending cap. Noncurrent S3 object versions are
+retained without automatic expiration and also incur storage charges.
 
 ## Destroy the application
 
@@ -251,7 +420,8 @@ costs low, but do not impose a spending cap.
 cdk destroy TouchlineLambdaStack --profile "$AWS_PROFILE"
 ```
 
-This deletes the Lambda, execution role, and log group (including its logs).
+This deletes the schedule, schedule group, Scheduler role, Lambda, Lambda
+execution role, asynchronous configuration, and log group (including its logs).
 The report bucket and objects are **retained** and can continue to incur S3
 charges. Delete them manually only after confirming the reports are no longer
 needed. A newly deployed stack creates a new report bucket; it does not

@@ -88,7 +88,8 @@ Illustrative successful body (shortened):
 - Fails the whole analysis on invalid data rather than silently excluding players
   or assigning fabricated form values.
 - Returns 504 for HTTP timeouts and 502 for other upstream HTTP, JSON, or data
-  errors. The body contains `error`; the underlying exception is logged.
+  errors on manual invocations. The body contains `error`; the underlying
+  exception is logged. Scheduled invocations raise these errors for retries.
 - Does not suppress unexpected programming errors.
 
 ### Stored report
@@ -119,10 +120,46 @@ fetching, JSON, or validation errors therefore leave the last successful report
 untouched. S3 atomically replaces the object on a successful write.
 
 A `200` means both analysis and upload succeeded. S3 SDK/transport errors are
-logged with tracebacks and return `500` with `{"error": "Unable to store gameweek report"}`.
+logged with tracebacks and, for manual events, return `500` with
+`{"error": "Unable to store gameweek report"}`.
 Missing/blank `REPORT_BUCKET` and unexpected exceptions are logged with
 tracebacks and re-raised. The bucket remains private; see the infrastructure
 guide for the exact IAM policy, redeployment, and console verification.
+
+### Scheduled invocations
+
+The CDK stack adds an Amazon EventBridge Scheduler `rate(6 hours)` schedule
+targeting this same Lambda. It is disabled by default; enable it by deploying
+with `--parameters ScheduleEnabled=true`, and disable with
+`--parameters ScheduleEnabled=false`. See the
+[infrastructure guide](../../infra/README.md#automatic-six-hour-analysis)
+for full deployment and verification commands.
+
+Scheduler assumes its dedicated IAM execution role and calls Lambda's Invoke
+API asynchronously. AWS runs the deployed container image, without FastAPI,
+React, Docker Compose, or Docker Desktop running. Docker is needed only for
+local builds/deployment.
+
+Events marked `{"source":"touchline.gameweek.scheduler"}` raise upstream and
+S3 failures instead of returning error envelopes, so Lambda recognizes failed
+executions. Other events retain the manual response contract. Scheduler retries
+delivery twice within one hour; Lambda separately allows one function-error
+retry with a one-hour asynchronous event age limit. Duplicate delivery remains
+possible, and these Lambda settings apply to all asynchronous invocations.
+There is no dead-letter queue; exhausted events are discarded.
+
+INFO start/success logs and exception logs include `invocationType` and Lambda
+`requestId`. Scheduler adds schedule ARN, scheduled time, execution ID, and
+delivery attempt number to the payload and logs. The source marker is for
+diagnosis, not authentication.
+
+Both report and response serialization complete before publication. There is
+no delete-before-write and no error payload is uploaded over the report.
+The deployed bucket is versioned and retained, and the Lambda cannot delete
+objects or versions. S3 publishes complete objects atomically; versioning
+preserves the prior successful report even if a write commits but its response
+is lost or the invocation subsequently times out. This is not a transaction
+between S3 and Lambda status, nor an ordering guarantee for concurrent writes.
 
 The connect timeout is 3 seconds; read, write, and pool timeouts are each
 10 seconds. These are HTTP phase/inactivity timeouts, **not** an overall
