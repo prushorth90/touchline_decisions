@@ -16,6 +16,8 @@ from app.config import get_settings
 from app.dependencies import AppContainer
 from app.fpl import CacheCoordinator, FplApiClient, FplApiError, FplDataService
 from app.health_api import router as health_router
+from app.insights import GameweekInsightsService
+from app.insights_api import router as insights_router
 from app.middleware import ApplicationMiddleware
 from app.persistence import Persistence
 from app.profile_api import router as profile_router
@@ -48,6 +50,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         fpl_service,
         recommendation_service,
         coach_service,
+        GameweekInsightsService(settings),
     )
     yield
     await http_client.aclose()
@@ -83,6 +86,7 @@ def create_app() -> FastAPI:
     app.include_router(coach_router)
     app.include_router(profile_router)
     app.include_router(health_router)
+    app.include_router(insights_router)
 
     @app.exception_handler(HTTPException)
     async def handle_http_exception(_request: Request, error: HTTPException) -> JSONResponse:

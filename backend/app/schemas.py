@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 
 class ApiModel(BaseModel):
@@ -14,6 +14,17 @@ class ProblemDetails(ApiModel):
     title: str
     detail: str | None = None
     traceId: str | None = None
+
+
+class GameweekInsightPlayer(ApiModel):
+    name: str = Field(min_length=1)
+    form: float = Field(strict=True, allow_inf_nan=False)
+    total_points: int = Field(strict=True)
+
+
+class GameweekInsightsResponse(ApiModel):
+    generatedAt: AwareDatetime
+    players: list[GameweekInsightPlayer] = Field(max_length=5)
 
 
 class FplGameweekResponse(ApiModel):

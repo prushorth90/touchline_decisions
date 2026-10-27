@@ -1,4 +1,6 @@
 from functools import lru_cache
+from pathlib import Path
+from typing import Literal
 from urllib.parse import quote_plus
 
 from pydantic import AliasChoices, Field
@@ -60,6 +62,9 @@ class Settings(BaseSettings):
         default="/app/agents",
         validation_alias=AliasChoices("AGENT_DIRECTORY", "Coach__AgentDirectory"),
     )
+    insights_source: Literal["fixture", "s3"] = "fixture"
+    insights_fixture_path: Path = Path(__file__).parent / "fixtures" / "gameweek.json"
+    report_bucket: str = ""
 
     @property
     def cors_origins(self) -> list[str]:

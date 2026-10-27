@@ -26,6 +26,9 @@ services:
       dockerfile: backend/Dockerfile
     environment:
       ENVIRONMENT: Production
+      INSIGHTS_SOURCE: ${INSIGHTS_SOURCE:-s3}
+      REPORT_BUCKET: ${REPORT_BUCKET:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-eu-west-2}
       AGENT_DIRECTORY: /app/agents
       ConnectionStrings__PostgreSQL: Host=postgres;Port=5432;Database=${POSTGRES_DB:-fpl};Username=${POSTGRES_USER:-fpl};Password=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       Redis__ConnectionString: redis:6379,password=${REDIS_PASSWORD:?REDIS_PASSWORD must be set}

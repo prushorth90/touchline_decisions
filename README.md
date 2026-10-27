@@ -163,10 +163,85 @@ The React application uses these preserved endpoints:
 - `POST /api/coach/chat/stream`
 - `GET`, `POST`, and `PUT /api/profiles`
 - `GET /health`
+- `GET /api/insights/gameweek`
 
-Response fields remain camelCase. The Coach streaming endpoint emits `progress`, then `complete`, or an `error` event after streaming has started. Validation and operational errors use `application/problem+json`.
+Existing response fields remain camelCase. Insights preserve the Lambda report's mixed naming (`generatedAt` and `total_points`). The Coach streaming endpoint emits `progress`, then `complete`, or an `error` event after streaming has started. Validation and operational errors use `application/problem+json`.
 
 FastAPI handlers declare Pydantic request and response models and resolve application services through `Depends`. A lifespan-created container owns the shared `httpx` client, Redis connection, SQLAlchemy engine/session factory, persistence service, recommendation service, and Coach orchestrator. Tests replace dependencies with `app.dependency_overrides`.
+
+## Gameweek Insights
+
+`GET /api/insights/gameweek` returns the last published report, not a live FPL
+calculation. The S3 contract is the object written by the Lambda handler, rather
+than its invocation response (which uses `generated_at`):
+
+```json
+{
+  "generatedAt": "2026-10-27T12:00:00Z",
+  "players": [
+    {"name": "Sample Player 1", "form": 9.5, "total_points": 80}
+  ]
+}
+```
+
+The timestamp is timezone-aware. Up to five players are returned in the Lambda's
+descending-form order, including its stable ordering for ties. Reports with more
+than five players or malformed fields are rejected, not silently truncated.
+
+### Local mode (no AWS credentials)
+
+`INSIGHTS_SOURCE=fixture` is the backend default and is explicitly set by
+development Compose. The bundled
+[fixture](backend/app/fixtures/gameweek.json) contains five **synthetic** players
+and a fixed timestamp; it is not live advice. Optionally set
+`INSIGHTS_FIXTURE_PATH` to another Lambda-compatible JSON file (inside the
+container when using Docker). Both backend images include the bundled fixture.
+No boto3 client, AWS credential lookup, or S3 request occurs in fixture mode.
+
+```bash
+curl http://localhost:5082/api/insights/gameweek
+```
+
+### S3 mode
+
+Set `INSIGHTS_SOURCE=s3`, `REPORT_BUCKET` to the CDK stack's `ReportBucketName`
+output, and `AWS_DEFAULT_REGION` to the deployed bucket's region. Production
+Compose forwards these settings and defaults to S3; set `INSIGHTS_SOURCE=fixture`
+in its environment file for a credential-free demo. No AWS credentials are needed
+at application startup, even in S3 mode. An unconfigured S3 request returns 503
+without affecting the other endpoints.
+
+Use the standard boto3 credential chain (prefer an IAM workload role on AWS).
+For standalone local S3 access, an AWS profile is also supported. Container S3
+access requires explicitly supplying a role or credentials/profile mount through
+your deployment configuration; Compose does not mount host credentials. Do not
+commit AWS keys. The backend identity needs only `s3:GetObject` on
+`arn:aws:s3:::<bucket>/reports/latest.json` (plus `kms:Decrypt` if using a
+customer-managed KMS key). The existing Lambda's write-only role is separate and
+is not changed by this integration.
+
+### Request flow and errors
+
+1. The existing FastAPI application routes the request to the insights router.
+2. `Depends(get_insights_service)` resolves the lifespan-created insights service
+   from `AppContainer`.
+3. The synchronous route runs in FastAPI's worker pool, keeping blocking file and
+   boto3 I/O off the async event loop.
+4. The service reads either the fixture or S3's `reports/latest.json` using
+   `get_object`, bounded connection/read timeouts, and at most three SDK attempts.
+   The S3 client and response stream are closed after each request.
+5. Pydantic validates the report and FastAPI serializes the timestamp and players.
+   The generation time comes from the report, never the request time.
+
+Missing reports return **404**. AWS/credential/configuration or local file I/O
+failures return **503**. Invalid report JSON/schema returns **502**. All use the
+existing sanitized `application/problem+json` error format. Logs record safe
+failure categories without AWS messages, report contents, or credentials.
+S3 failures never silently fall back to sample data.
+
+Run the focused tests with `cd backend && pytest tests/test_insights.py`.
+They exercise the fixture, lifespan/DI wiring, real boto3 requests stubbed with
+botocore (no AWS traffic), validation, and sanitized failures.
 
 ## FPL Data And Caching
 

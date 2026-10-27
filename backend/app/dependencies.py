@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.coach import CoachService
 from app.fpl import FplDataService
+from app.insights import GameweekInsightsService
 from app.persistence import Persistence
 from app.recommendations import RecommendationService
 
@@ -23,6 +24,7 @@ class AppContainer:
     fpl: FplDataService
     recommendations: RecommendationService
     coach: CoachService
+    insights: GameweekInsightsService
 
 
 def get_container(request: Request) -> AppContainer:
@@ -41,6 +43,10 @@ def get_coach_service(container: Annotated[AppContainer, Depends(get_container)]
     return container.coach
 
 
+def get_insights_service(container: Annotated[AppContainer, Depends(get_container)]) -> GameweekInsightsService:
+    return container.insights
+
+
 def get_persistence(container: Annotated[AppContainer, Depends(get_container)]) -> Persistence:
     return container.persistence
 
@@ -57,6 +63,7 @@ async def get_session(container: Annotated[AppContainer, Depends(get_container)]
 FplServiceDependency = Annotated[FplDataService, Depends(get_fpl_service)]
 RecommendationServiceDependency = Annotated[RecommendationService, Depends(get_recommendation_service)]
 CoachServiceDependency = Annotated[CoachService, Depends(get_coach_service)]
+GameweekInsightsServiceDependency = Annotated[GameweekInsightsService, Depends(get_insights_service)]
 PersistenceDependency = Annotated[Persistence, Depends(get_persistence)]
 RedisDependency = Annotated[Redis, Depends(get_redis)]
 SessionDependency = Annotated[AsyncSession, Depends(get_session)]

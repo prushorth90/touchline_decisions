@@ -27,6 +27,10 @@ services:
       - "5082:8080"
     environment:
       ASPNETCORE_ENVIRONMENT: Development
+      INSIGHTS_SOURCE: s3
+      REPORT_BUCKET: touchlinelambdastack-gameweekreports28eb2f63-wdgvgoeejxs1
+      AWS_DEFAULT_REGION: us-west-2
+      AWS_PROFILE: prushorthaws
       ASPNETCORE_URLS: http://+:8080
       ConnectionStrings__PostgreSQL: Host=postgres;Port=5432;Database=${POSTGRES_DB:-fpl};Username=${POSTGRES_USER:-fpl};Password=${POSTGRES_PASSWORD:-change_me}
       Persistence__RecommendationSnapshotMinutes: ${RECOMMENDATION_SNAPSHOT_MINUTES:-15}
@@ -35,6 +39,7 @@ services:
     volumes:
       - ./backend:/app
       - ./.github/agents:/app/agents:ro
+      - ${HOME}/.aws:/root/.aws:ro
     depends_on:
       postgres:
         condition: service_healthy

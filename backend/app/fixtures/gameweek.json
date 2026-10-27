@@ -1,0 +1,10 @@
+{
+  "generatedAt": "2026-10-27T12:00:00+00:00",
+  "players": [
+    {"name": "Sample Player 1", "form": 9.5, "total_points": 80},
+    {"name": "Sample Player 2", "form": 8.2, "total_points": 72},
+    {"name": "Sample Player 3", "form": 7.8, "total_points": 68},
+    {"name": "Sample Player 4", "form": 7.1, "total_points": 64},
+    {"name": "Sample Player 5", "form": 6.9, "total_points": 60}
+  ]
+}
