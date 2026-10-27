@@ -25,6 +25,7 @@ describe('App routing', () => {
     ['/transfers', 'Transfers'],
     ['/players', 'Players'],
     ['/fixtures', 'Fixtures'],
+    ['/insights', 'Gameweek Intelligence'],
     ['/recommendations', 'Recommendations'],
     ['/coach', 'AI Coach'],
     ['/settings', 'Settings'],
@@ -34,6 +35,13 @@ describe('App routing', () => {
 
   it('renders setup when there is no saved team', () => {
     expect(renderRoute('/setup', null)).toContain('Find your FPL team')
+  })
+
+  it('links to gameweek intelligence in desktop and mobile navigation', () => {
+    const markup = renderRoute('/insights')
+
+    expect((markup.match(/href="\/insights"/g) ?? []).length).toBe(2)
+    expect((markup.match(/aria-current="page"/g) ?? []).length).toBe(2)
   })
 
   it('renders the not-found page for an unknown route', () => {

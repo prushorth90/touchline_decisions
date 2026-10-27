@@ -3,6 +3,7 @@ import { AppShell } from './components/layout/AppShell'
 import { DashboardPage } from './pages/DashboardPage'
 import { CoachPage } from './pages/CoachPage'
 import { FixturesPage } from './pages/FixturesPage'
+import { GameweekIntelligencePage } from './pages/GameweekIntelligencePage'
 import { MyTeamPage } from './pages/MyTeamPage'
 import { NotFoundPage } from './pages/NotFoundPage'
 import { PlayersPage } from './pages/PlayersPage'
@@ -34,6 +35,7 @@ function App({ initialTeamId }: AppProps = {}) {
           <Route path="transfers" element={<TransfersPage />} />
           <Route path="players" element={<PlayersPage />} />
           <Route path="fixtures" element={<FixturesPage />} />
+          <Route path="insights" element={<GameweekIntelligencePage />} />
           <Route path="recommendations" element={<RecommendationsPage />} />
           <Route path="coach" element={<CoachPage />} />
           <Route path="settings" element={<SettingsPage />} />

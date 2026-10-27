@@ -7,6 +7,7 @@ import {
   Settings,
   Shield,
   Sparkles,
+  TrendingUp,
   Users,
 } from 'lucide-react'
 import { Link, NavLink, Outlet } from 'react-router-dom'
@@ -20,6 +21,7 @@ const navigation = [
   { label: 'Players', to: '/players', icon: Users },
   { label: 'Fixtures', to: '/fixtures', icon: CalendarDays },
   { label: 'Recommendations', to: '/recommendations', icon: Lightbulb },
+  { label: 'Gameweek Intelligence', to: '/insights', icon: TrendingUp },
   { label: 'AI Coach', to: '/coach', icon: MessagesSquare },
 ]
 
@@ -96,7 +98,7 @@ export function AppShell() {
           <Outlet />
         </main>
 
-        <nav className="fixed inset-x-0 bottom-0 z-30 grid h-16 grid-cols-7 border-t border-black/10 bg-[#151a17] px-1 text-white lg:hidden" aria-label="Mobile navigation">
+        <nav className="fixed inset-x-0 bottom-0 z-30 grid h-16 grid-cols-8 border-t border-black/10 bg-[#151a17] px-1 text-white lg:hidden" aria-label="Mobile navigation">
           {navigation.map(({ label, to, icon: Icon, end }) => (
             <NavLink
               key={to}

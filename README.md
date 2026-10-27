@@ -171,6 +171,28 @@ FastAPI handlers declare Pydantic request and response models and resolve applic
 
 ## Gameweek Insights
 
+### Frontend: Gameweek Intelligence
+
+Open **Gameweek Intelligence** from the desktop sidebar or mobile navigation
+(`/insights`, after connecting an FPL team). The page displays up to five
+recommended players with their form and total points, preserving the report's
+ranking. The generation timestamp is displayed in the browser's local timezone,
+including the timezone label; refreshing never substitutes the request time.
+Loading, empty-report, and unavailable-report states are provided, with a retry
+action on failure.
+
+The page uses the shared frontend API client (`VITE_API_BASE_URL`) and React
+Query with a team-independent cache key, 15-minute freshness, request
+cancellation, and the application's existing retry policy. **Refresh** fetches
+the latest published report; it does not trigger a new calculation.
+
+When enabled, EventBridge Scheduler invokes the analysis Lambda every six
+hours. Lambda fetches FPL data, ranks players, and writes the report to private
+S3 at `reports/latest.json`. React requests only
+`GET /api/insights/gameweek` from FastAPI. The backend reads and validates the
+stored report and returns JSON to the browser. React never calls Lambda or S3
+and needs no AWS credentials. Fixture mode uses the same API and UI.
+
 `GET /api/insights/gameweek` returns the last published report, not a live FPL
 calculation. The S3 contract is the object written by the Lambda handler, rather
 than its invocation response (which uses `generated_at`):
