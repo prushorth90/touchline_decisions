@@ -199,6 +199,80 @@ class TouchlineLambdaStackTests(unittest.TestCase):
             ]]},
         })
 
+    def test_analysis_jobs_table_is_on_demand_and_retained(self) -> None:
+        self.template.resource_count_is("AWS::DynamoDB::Table", 1)
+        self.template.has_resource("AWS::DynamoDB::Table", {
+            "Properties": {
+                "TableName": "TouchlineAnalysisJobs",
+                "KeySchema": [{"AttributeName": "jobId", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "jobId", "AttributeType": "S"}],
+                "BillingMode": "PAY_PER_REQUEST",
+                "ProvisionedThroughput": Match.absent(),
+                "SSESpecification": {"SSEEnabled": False},
+            },
+            "DeletionPolicy": "Retain",
+            "UpdateReplacePolicy": "Retain",
+        })
+
+    def test_analysis_queues_are_standard_encrypted_and_bounded(self) -> None:
+        self.template.resource_count_is("AWS::SQS::Queue", 2)
+        resources = self.template.to_json()["Resources"]
+        dlq_id = next(
+            key for key, value in resources.items()
+            if value["Type"] == "AWS::SQS::Queue"
+            and value["Properties"]["QueueName"] == "TouchlineAnalysisDLQ"
+        )
+        self.template.has_resource_properties("AWS::SQS::Queue", {
+            "QueueName": "TouchlineAnalysisQueue",
+            "FifoQueue": Match.absent(),
+            "MessageRetentionPeriod": 345600,
+            "VisibilityTimeout": 300,
+            "SqsManagedSseEnabled": True,
+            "RedrivePolicy": {
+                "deadLetterTargetArn": {"Fn::GetAtt": [dlq_id, "Arn"]},
+                "maxReceiveCount": 5,
+            },
+        })
+        self.template.has_resource_properties("AWS::SQS::Queue", {
+            "QueueName": "TouchlineAnalysisDLQ",
+            "FifoQueue": Match.absent(),
+            "MessageRetentionPeriod": 1209600,
+            "VisibilityTimeout": 300,
+            "SqsManagedSseEnabled": True,
+            "RedrivePolicy": Match.absent(),
+        })
+
+    def test_both_analysis_queues_require_https(self) -> None:
+        self.template.resource_count_is("AWS::SQS::QueuePolicy", 2)
+        resources = self.template.to_json()["Resources"]
+        for queue_id, queue in resources.items():
+            if queue["Type"] == "AWS::SQS::Queue":
+                self.template.has_resource_properties("AWS::SQS::QueuePolicy", {
+                    "Queues": [{"Ref": queue_id}],
+                    "PolicyDocument": {
+                        "Statement": [{
+                            "Effect": "Deny",
+                            "Action": "sqs:*",
+                            "Principal": {"AWS": "*"},
+                            "Resource": {"Fn::GetAtt": [queue_id, "Arn"]},
+                            "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+                        }],
+                    },
+                })
+
+    def test_analysis_outputs_reference_the_correct_resources(self) -> None:
+        resources = self.template.to_json()["Resources"]
+        for output, resource_type, name_property, name in [
+            ("AnalysisJobsTableName", "AWS::DynamoDB::Table", "TableName", "TouchlineAnalysisJobs"),
+            ("AnalysisQueueUrl", "AWS::SQS::Queue", "QueueName", "TouchlineAnalysisQueue"),
+            ("AnalysisDLQUrl", "AWS::SQS::Queue", "QueueName", "TouchlineAnalysisDLQ"),
+        ]:
+            resource_id = next(
+                key for key, value in resources.items()
+                if value["Type"] == resource_type and value["Properties"][name_property] == name
+            )
+            self.template.has_output(output, {"Value": {"Ref": resource_id}})
+
     def test_only_minimal_application_resources(self) -> None:
         allowed = {
             "AWS::Lambda::Function",
@@ -210,6 +284,9 @@ class TouchlineLambdaStackTests(unittest.TestCase):
             "AWS::Scheduler::Schedule",
             "AWS::Scheduler::ScheduleGroup",
             "AWS::Lambda::EventInvokeConfig",
+            "AWS::DynamoDB::Table",
+            "AWS::SQS::Queue",
+            "AWS::SQS::QueuePolicy",
         }
         resources = self.template.to_json()["Resources"]
         self.assertLessEqual({resource["Type"] for resource in resources.values()}, allowed)

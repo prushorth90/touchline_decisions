@@ -2,12 +2,14 @@ import json
 from pathlib import Path
 
 from aws_cdk import ArnFormat, CfnCondition, CfnOutput, CfnParameter, Duration, Fn, RemovalPolicy, Stack
+from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ecr_assets as ecr_assets
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_scheduler as scheduler
+from aws_cdk import aws_sqs as sqs
 from constructs import Construct
 
 
@@ -27,6 +29,43 @@ class TouchlineLambdaStack(Stack):
             self,
             "EnableGameweekSchedule",
             expression=Fn.condition_equals(schedule_enabled.value_as_string, "true"),
+        )
+
+        analysis_jobs = dynamodb.Table(
+            self,
+            "AnalysisJobs",
+            table_name="TouchlineAnalysisJobs",
+            partition_key=dynamodb.Attribute(
+                name="jobId",
+                type=dynamodb.AttributeType.STRING,
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            encryption=dynamodb.TableEncryption.DEFAULT,
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+        analysis_dlq = sqs.Queue(
+            self,
+            "AnalysisDLQ",
+            queue_name="TouchlineAnalysisDLQ",
+            fifo=False,
+            retention_period=Duration.days(14),
+            visibility_timeout=Duration.minutes(5),
+            encryption=sqs.QueueEncryption.SQS_MANAGED,
+            enforce_ssl=True,
+        )
+        analysis_queue = sqs.Queue(
+            self,
+            "AnalysisQueue",
+            queue_name="TouchlineAnalysisQueue",
+            fifo=False,
+            retention_period=Duration.days(4),
+            visibility_timeout=Duration.minutes(5),
+            encryption=sqs.QueueEncryption.SQS_MANAGED,
+            enforce_ssl=True,
+            dead_letter_queue=sqs.DeadLetterQueue(
+                queue=analysis_dlq,
+                max_receive_count=5,
+            ),
         )
 
         report_bucket = s3.Bucket(
@@ -122,6 +161,9 @@ class TouchlineLambdaStack(Stack):
             ),
         )
 
+        CfnOutput(self, "AnalysisJobsTableName", value=analysis_jobs.table_name)
+        CfnOutput(self, "AnalysisQueueUrl", value=analysis_queue.queue_url)
+        CfnOutput(self, "AnalysisDLQUrl", value=analysis_dlq.queue_url)
         CfnOutput(self, "FunctionName", value=function.function_name)
         CfnOutput(self, "FunctionArn", value=function.function_arn)
         CfnOutput(self, "LogGroupName", value=log_group.log_group_name)

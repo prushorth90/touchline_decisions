@@ -1,9 +1,72 @@
-# Gameweek analysis Lambda infrastructure
+# Touchline Decisions infrastructure
 
 Minimal AWS CDK v2 application, independent of Docker Compose, the backend,
 PostgreSQL, and Redis. The stack is named `TouchlineLambdaStack`. It builds
 the existing [Lambda image](../lambda/gameweek_analysis/Dockerfile), not the
 Compose application. No credentials or account IDs are stored in the code.
+
+## Personalized squad analysis: infrastructure only
+
+The stack also provisions the foundation for asynchronous personalized analysis:
+
+| Resource | Purpose | Configuration |
+| --- | --- | --- |
+| `TouchlineAnalysisJobs` | Store each job's status and, later, its result or result location so a client can check progress independently of processing. | DynamoDB table with string partition key `jobId`, on-demand billing, and default encryption with an AWS-owned key. |
+| `TouchlineAnalysisQueue` | Buffer analysis requests so a future worker can process them independently of an API request. | Standard SQS queue, 4-day message retention, 5-minute visibility timeout, and redrive to the DLQ after five receives without successful deletion. |
+| `TouchlineAnalysisDLQ` | Isolate repeatedly failing messages for inspection and manual recovery instead of retrying indefinitely. | Standard SQS queue, 14-day retention, and 5-minute visibility timeout. |
+
+Both queues use SQS-managed encryption at rest and policies denying non-HTTPS
+requests. No public access grants, producer/consumer IAM permissions, customer
+KMS keys, indexes, or provisioned capacity are added. On-demand DynamoDB avoids
+paying for idle provisioned throughput; storage and actual requests still cost
+money. SQS charges depend on requests and usage.
+
+The visibility timeout hides a received message temporarily; it does not limit
+processing duration or automatically detect an application failure. A future
+worker must delete successfully processed messages. Set the timeout to fit that
+worker's runtime and retry model before connecting a consumer. Standard queues
+can deliver duplicates and do not guarantee ordering, so that worker must be
+idempotent. Nothing consumes messages yet: messages sent now will wait and
+eventually expire, not move to the DLQ just because no consumer is running.
+For standard queues, DLQ expiration uses the original enqueue timestamp, so its
+longer retention gives more time for recovery but not necessarily 14 days after
+the move.
+
+CloudFormation outputs `AnalysisJobsTableName`, `AnalysisQueueUrl`, and
+`AnalysisDLQUrl` identify the new resources. The existing Lambda, S3 bucket,
+EventBridge Scheduler, permissions, and outputs are unchanged. No SQS consumer
+Lambda, event-source mapping, or FastAPI changes are included.
+
+The table is retained on stack deletion/replacement to protect job records;
+retained storage can continue to incur charges and must be cleaned up explicitly
+when no longer needed. Queues use CDK's default destroy policy: deleting the
+stack deletes the queues and their messages. The fixed names require these
+resources not to already exist in the deployment account/region; a retained
+table needs deliberate import/reuse before recreating the stack.
+
+### Review and deploy this addition
+
+With the dependencies below installed, run from the repository root:
+
+```bash
+cd infra
+source .venv/bin/activate
+export AWS_PROFILE=prushorthaws
+export AWS_REGION=us-west-2
+export AWS_DEFAULT_REGION=us-west-2
+
+python -m unittest discover -s tests -v
+cdk synth TouchlineLambdaStack --profile prushorthaws
+cdk diff TouchlineLambdaStack --profile prushorthaws --no-change-set
+# Only run after reviewing the diff:
+cdk deploy TouchlineLambdaStack --profile prushorthaws
+```
+
+`--no-change-set` requests a template-only diff instead of creating a
+CloudFormation change set. Check that the diff only adds the table, queues,
+queue policies, and outputs. No deployment happens until you run `cdk deploy`.
+Use the existing stack's account/region and keep its current `ScheduleEnabled`
+parameter value; this addition does not change the scheduling configuration.
 
 ## Prerequisites and installation
 
